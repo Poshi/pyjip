@@ -344,12 +344,23 @@ def _setup_signal_handler(job, save=False):
     :type job: :class:`jip.db.Job`
     :param session: optional database session
     """
+
     def handle_signal(signum, frame):
         log.warn("Signal %s received, going to fail state", signum)
+
+        # Some signal arrived and maybe the job object is detached,
+        # we need to re-create the session and re-attach the object
+        from sqlalchemy import inspect
+        insp = inspect(job)
+        if insp.detached:
+            session = jip.db.create_session()
+            session.merge(add)
+
         set_state(job, jip.db.STATE_FAILED, check_state=save)
         if save:
             db.update_job_states([job] + job.pipe_to)
         sys.exit(1)
+        
     log.debug("Setting up signal handler for %s", job)
     signal(SIGTERM, handle_signal)
     signal(SIGINT, handle_signal)
@@ -657,7 +668,7 @@ def submit_job(job, clean=False, force=False, save=True,
     return True
 
 
-def run_job(job, save=False, profiler=False, submit_embedded=False):
+def run_job(job, save=False, profiler=False, submit_embedded=False, closeDB=False):
     """Execute the given job. This method returns immediately in case the
     job has a pipe source. Otherwise the job and all its dispatch jobs are
     executed.
@@ -697,6 +708,7 @@ def run_job(job, save=False, profiler=False, submit_embedded=False):
         if not os.path.exists(child.working_directory):
             os.makedirs(child.working_directory)
 
+    # Execute the commands
     for dispatcher_node in dispatcher_nodes:
         dispatcher_node.run(profiler=profiler)
 
@@ -706,11 +718,23 @@ def run_job(job, save=False, profiler=False, submit_embedded=False):
         db.update_job_states(all_jobs)
 
     success = True
+
+    # Close the DB connection for the execution of the commands,
+    # the job object gets the detached state
+    session=jip.db.create_session()
+    jip.db.commit_session(session)
+    session.close()
+
     # we collect the state of all jobs in the dispatcher first
     # a single failure will cause ALL nodes/jobs in that dispatcher
     # to be marked as failed
     for dispatcher_node in reversed(dispatcher_nodes):
         success &= dispatcher_node.wait()
+
+    # The commands finished their execution, re-attach the job object
+    session = jip.db.create_session()
+    session.add(job)
+
     # get the new state and update all jobs
     new_state = db.STATE_DONE if success else db.STATE_FAILED
     for dispatcher_node in reversed(dispatcher_nodes):

@@ -19,6 +19,7 @@ import jip.db
 from . import parse_args
 import sys
 import os
+from sqlalchemy.pool import NullPool
 
 log = getLogger("jip.cli.jip_exec")
 
@@ -30,7 +31,7 @@ def main():
         log.info("Starting job with id %s stored in %s",
                  args['<id>'],
                  args['--db'])
-        jip.db.init(path=args['--db'])
+        jip.db.init(path=args['--db'], pool=NullPool)
         job = jip.db.get(args['<id>'])
         if not job:
             log.error("Requested job with id %s not found!", args['<id>'])

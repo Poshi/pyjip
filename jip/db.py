@@ -89,7 +89,7 @@ job_groups = Table("job_groups", Base.metadata,
 class InputFile(Base):
     __tablename__ = 'files_in'
     id = Column(Integer, primary_key=True)
-    path = Column('path', String, index=True)
+    path = Column('path', String(length=767), index=True) # Length is 767 because MySQL does not support keys longer than 767 by default
     job_id = Column('job_id', Integer, ForeignKey('jobs.id'))
 
     def __repr__(self):
@@ -99,7 +99,7 @@ class InputFile(Base):
 class OutputFile(Base):
     __tablename__ = 'files_out'
     id = Column(Integer, primary_key=True)
-    path = Column('path', String, index=True)
+    path = Column('path', String(length=767), index=True) # Length is 767 because MySQL does not support keys longer than 767 by default
     job_id = Column('job_id', Integer, ForeignKey('jobs.id'))
 
     def __repr__(self):
@@ -157,7 +157,7 @@ class Job(Base):
     #: Finished data of the jobs
     finish_date = Column(DateTime)
     #: Current job state. See `job states <job_states>` for more information
-    state = Column(String, default=STATE_HOLD)
+    state = Column(String(length=256), default=STATE_HOLD)
     #: optional name of the host that executes this job. This has to be set
     #: by the cluster implementation at runtime. If the cluster implementation
     #: does not support this, the field might not be set.
@@ -571,7 +571,7 @@ class Job(Base):
             return "JOB-%s" % (str(self.id) if self.id is not None else "0")
 
 
-def init(path=None, in_memory=False):
+def init(path=None, in_memory=False, pool=None):
     """Initialize the database.
 
     This takes a valid SQLAlchemy database URL or a path to a file
@@ -581,17 +581,24 @@ def init(path=None, in_memory=False):
     :param path: database url or path to a file
     :param in_memory: if set to True, an in-memory database is created
     """
-    from sqlalchemy import create_engine as slq_create_engine
+    from sqlalchemy import create_engine as sql_create_engine
     from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.pool import NullPool, QueuePool
     from os.path import exists, dirname, abspath
     from os import makedirs, getenv
     global engine, Session, db_path, db_in_memory, global_session
+
+    # Constants: DB errors (MySQL numbers)
+    DBAPIError_UNKNOWNDATABASE = 1049
+    DBAPIError_UNKNOWNHOST     = 2005
+    
 
     if in_memory:
         log.debug("Initialize in-memory DB")
         db_in_memory = True
         db_path = None
-        engine = slq_create_engine("sqlite://")
+        engine = sql_create_engine("sqlite://")
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine, expire_on_commit=False)
         return
@@ -606,7 +613,7 @@ def init(path=None, in_memory=False):
             raise LookupError("Database engine configuration not found")
 
     # make sure folders exists
-    path_split = path.split(":///")
+    path_split = path.split("://")
     if len(path_split) != 2:
         ## dynamically create an sqlite path
         if not path.startswith("/"):
@@ -614,22 +621,66 @@ def init(path=None, in_memory=False):
         path_split = ["sqlite", path]
         path = "sqlite:///%s" % path
 
-    type, folder = path_split
-    if not exists(folder) and not exists(dirname(folder)):
-        makedirs(dirname(folder))
     # logging cinfiguration
     #import logging
     #getLogger('sqlalchemy.engine').setLevel(logging.DEBUG)
 
+    # Pooling configuration
+    if pool is None:
+        # If nothing specific requested, use standard one
+        pool = QueuePool
+
+    # Engine creation
+    type, folder = path_split
+    create_tables = False
+    if type == 'sqlite':
+        if not exists(folder) and not exists(dirname(folder)):
+            makedirs(dirname(folder))
+        # check before because engine creation will create the file
+        create_tables = not exists(folder)
+        # create engine
+        engine = sql_create_engine(path)
+    elif type == 'mysql':
+        import urlparse as up
+        
+        # Split connection string
+        dburl = up.urlsplit(path)
+        db_conn_string = up.urlunsplit((dburl.scheme, dburl.netloc, '', dburl.query, dburl.fragment))
+        db_database = dburl.path[1:] # Trim the forward slash
+        
+        # Prepare the connection to the DBMS, no DB selected
+        engine = sql_create_engine(db_conn_string, poolclass=pool)
+
+        # Now, try to use the connection and DB name to validate
+        # connection parameters (host, port, username...) and DB name
+        try:
+            # Test if the DB name exists. If not, the select fails
+            engine.execute("USE " + db_database)
+        except OperationalError as e:
+            # DB name not found, create DB name, set it as active
+            # and flag for table creation
+            if e.orig[0] == DBAPIError_UNKNOWNDATABASE:
+                engine.execute("CREATE DATABASE " + db_database)
+                create_tables = True
+            else:
+                raise e
+        finally:
+            # Tests and DB creation finished. Dispose the engine to
+            # create a new one with the full definition
+            engine.dispose()
+
+        # DB name already exists and connection is working, create one
+        # with the full connection string
+        engine = sql_create_engine(path, poolclass=pool)
+
+
     db_path = path
     db_in_memory = False
-    # check before because engine creation will create the file
-    create_tables = not exists(folder) and type == "sqlite"
-    # create engine
-    engine = slq_create_engine(path)
+    # check before because engine creation for SQLite will create the
+    # file, in MySQL we can always issue the table creation
     # create tables
-    if create_tables:
-        Base.metadata.create_all(engine)
+    if create_tables or type == 'mysql':
+        Base.metadata.create_all(bind=engine, checkfirst=True)
     Session = sessionmaker(autoflush=False,
                            expire_on_commit=False)
     #Session = sessionmaker(expire_on_commit=False)
@@ -756,7 +807,7 @@ def _execute(stmt, values=None, attempts=5):
         except OperationalError as err:
             error = err
             import time
-            time.sleep(0.1)
+            time.sleep(0.5)
     raise error
 
 
@@ -868,10 +919,11 @@ def delete(jobs):
             relation_table.c.job_id == bindparam("_id")
         )
         stmt.append(dep)
+    
     # convert the job values
     values = [{"_id": j.id} for j in jobs if j.id is not None]
     if values:
-        _execute(stmt, values)
+        _execute(stmt[::-1], values) # Reverse the elements in the list to remove first the relations
 
 
 def get(job_id):
