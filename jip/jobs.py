@@ -354,7 +354,7 @@ def _setup_signal_handler(job, save=False):
         insp = inspect(job)
         if insp.detached:
             session = jip.db.create_session()
-            session.merge(add)
+            session.add(job)
 
         set_state(job, jip.db.STATE_FAILED, check_state=save)
         if save:
